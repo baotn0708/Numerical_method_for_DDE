@@ -1,0 +1,1 @@
+giai đoạn đầu code lộn xộn ghê :))
