@@ -2,6 +2,7 @@ import numpy as np
 from numpy.polynomial import Polynomial
 from scipy.optimize import fsolve
 import matplotlib.pyplot as plt
+import numdifftools as nd
 
 # =====================================================
 # 1. Các hàm tính nút nội suy cho các phương pháp collocation
@@ -15,7 +16,7 @@ def get_gauss_nodes(s):
 
 def get_radau_nodes(s):
     """Tính xấp xỉ các nút Radau trên [0,1] với c_s = 1.
-       (Ví dụ này dùng cách xấp xỉ đơn giản; thực tế cần công thức chính xác hơn.)"""
+       (Cách xấp xỉ đơn giản, thay đổi tùy nhu cầu)"""
     if s == 1:
         return np.array([1.0])
     else:
@@ -35,12 +36,12 @@ def get_lobatto_nodes(s):
 
 def get_chebyshev_nodes(s):
     """Tính các nút Chebyshev trên [0,1]."""
-    i = np.arange(1, s+1)
-    c = 0.5 * (1 - np.cos((2*i - 1)*np.pi/(2*s)))
+    i = np.arange(1, s + 1)
+    c = 0.5 * (1 - np.cos((2 * i - 1) * np.pi / (2 * s)))
     return c
 
 def get_hermite_nodes(s):
-    """Ở ví dụ này, ta dùng nút Gauss làm nút cơ bản cho Hermite (để minh họa)."""
+    """Ở ví dụ này, ta dùng nút Gauss làm nút cơ bản cho Hermite."""
     return get_gauss_nodes(s)
 
 # =====================================================
@@ -128,7 +129,6 @@ def get_history_value(t, history_segments, phi, t0):
             theta = (t - seg['t_start']) / seg['h']
             b_theta = seg['collocation'].continuous_extension(theta)
             return seg['y_start'] + seg['h'] * np.dot(b_theta, seg['K'])
-    # Nếu t vượt quá vùng lịch sử, trả về giá trị của đoạn cuối
     seg = history_segments[-1]
     return seg['y_start'] + seg['h'] * np.dot(seg['collocation'].b, seg['K'])
 
@@ -152,7 +152,7 @@ def collocation_step_dde(f, tau, get_history_value_func, phi, t, y, h, collocati
         K = K_flat.reshape((s,) + y.shape)
         F_val = np.zeros_like(K)
         for i in range(s):
-            t_i = t + c[i]*h
+            t_i = t + c[i] * h
             # Ước lượng y tại t_i
             y_i = y.copy()
             for j in range(s):
@@ -223,30 +223,30 @@ def solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0, method_name='gaus
     """
     collocation = CollocationMethod(method_name, s)
     t = t0
-    y = phi(t0)  # giá trị ban đầu
+    # Đảm bảo rằng giá trị ban đầu luôn là mảng có ít nhất một chiều
+    y = np.atleast_1d(phi(t0))
     ts = [t0]
     ys = [y.copy()]
-    history_segments = []  # dùng để lưu trữ các đoạn giải cho nội suy giá trị trễ
-
+    history_segments = []  # lưu trữ các đoạn nghiệm đã tính
+    
     h = h0
-    p = get_method_order(method_name, s)  # bậc của phương pháp
-
+    p = get_method_order(method_name, s)
+    
     SAFETY = 0.9  # hệ số an toàn khi điều chỉnh bước
-
+    
     while t < t_end:
         if t + h > t_end:
             h = t_end - t
-
-        # Lưu lại history_segments trước bước, nếu bước sau bị loại (reject) sẽ quay lại
+        
+        # Lưu lại history_segments trước bước, nếu bước sau bị reject sẽ khôi phục
         history_backup = history_segments.copy()
         
         # Tính nghiệm một bước với bước h (solution full)
         y_full, K_full = collocation_step_dde(f, tau, get_history_value, phi, t, y, h, collocation, t0, history_segments)
         
-        # Tính nghiệm qua hai bước với bước h/2 (solution half-step)
+        # Tính nghiệm qua hai bước với bước h/2 (step doubling)
         # Bước 1: từ t đến t+h/2
         y_mid, K_mid = collocation_step_dde(f, tau, get_history_value, phi, t, y, h/2, collocation, t0, history_segments)
-        # Lưu đoạn giữa t -> t+h/2
         seg_mid = {
             't_start': t,
             't_end': t + h/2,
@@ -260,12 +260,12 @@ def solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0, method_name='gaus
         # Bước 2: từ t+h/2 đến t+h, dùng y_mid làm giá trị khởi đầu
         y_half, K_half = collocation_step_dde(f, tau, get_history_value, phi, t + h/2, y_mid, h/2, collocation, t0, history_half)
         
-        # Ước tính sai số theo kỹ thuật step doubling
-        # Ta dùng hiệu sai: error ~ || y_half - y_full || / (2^p - 1)
+        # Ước tính sai số theo kỹ thuật step doubling:
+        # sai số ~ ||y_half - y_full|| / (2^p - 1)
         error_est = np.linalg.norm(y_half - y_full) / (2**p - 1)
-
+        
         if error_est < tol:
-            # Bước được chấp nhận: cập nhật t, y, và lưu segment toàn bước h (có thể lưu K_full)
+            # Bước được chấp nhận: cập nhật t, y và lưu history
             t += h
             y = y_half.copy()
             ts.append(t)
@@ -276,62 +276,88 @@ def solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0, method_name='gaus
                 'y_start': ys[-2].copy(),
                 'h': h,
                 'collocation': collocation,
-                'K': K_full  # chấp nhận K từ bước full
+                'K': K_full  # lưu lại hệ số K từ bước full
             }
             history_segments.append(seg)
-            # Điều chỉnh bước mới (tăng nếu sai số nhỏ)
+            # Điều chỉnh bước mới (có thể tăng nếu sai số nhỏ)
             factor = SAFETY * (tol / error_est)**(1/(p+1))
             h = min(h * min(2.0, max(0.1, factor)), h_max)
         else:
-            # Bước không chấp nhận: giảm bước và thử lại, không cập nhật history
+            # Bước không chấp nhận, giảm bước và thử lại
             factor = SAFETY * (tol / error_est)**(1/(p+1))
             h = max(h * max(0.1, factor), h_min)
-            history_segments = history_backup  # khôi phục history
+            history_segments = history_backup  # khôi phục lại history
             print(f"Step rejected at t={t:.4f}, error={error_est:.2e}, new h={h:.2e}")
-
+    
     return np.array(ts), np.array(ys)
 
 # =====================================================
-# 7. Ví dụ minh họa cho DDE thích nghi
-#     Ví dụ: y'(t) = -y(t) + y(t-1), với y(t)=1 cho t<=0.
+# Chạy ví dụ chính
 # =====================================================
 
 if __name__ == "__main__":
-    # Hàm f: y'(t) = -y(t) + y(t-τ)
-    def f(t, u, v):
-        return -u + v
-
-    # Hàm τ: độ trễ hằng số 1 (có thể mở rộng thành hàm phụ thuộc t, y)
-    def tau(t, y):
-        return 1.0
-
-    # Hàm lịch sử: φ(t)=1 cho mọi t <= t0
-    def phi(t):
-        return np.array([1.0])
+    # Định nghĩa hàm F và dẫn hàm dF (sử dụng numdifftools)
+    def F(t):
+        return np.log(1 + t**2) + np.sqrt(1 + t**4)
     
-    t0 = 0.0
-    t_end = 5.0
-    h0 = 0.1
-    tol = 1e-4
-
-    # Các ước lượng Lipschitz (chỉ để nhắc nhở, có thể dùng sau này)
-    L_f_u = 1.0
+    def dF(t):
+        df = nd.Derivative(F)
+        return df(t)
+    
+    # Định nghĩa hàm tau, phi và f, đảm bảo đầu ra luôn là mảng với ít nhất 1 chiều
+    def tau(t, y):
+        return 2.0
+    
+    def phi(t):
+        return np.atleast_1d(F(t))
+    
+    def f(t, y, y_delay):
+        y = np.atleast_1d(y)
+        y_delay = np.atleast_1d(y_delay)
+        return dF(t) * np.exp(y / F(t) - F(t - tau(t, y)) / y_delay)
+    
+    # Các thiết lập thời gian và bước ban đầu
+    t0 = 0.1
+    t_end = 3.01
+    h0 = 0.06
+    tol = 1e-6
+    
+    # Các tham số Lipschitz (dùng như nhắc nhở, chưa dùng trực tiếp)
+    L_f_u = 0.0
     L_f_v = 1.0
     L_tau_y = 0.0
-
-    # Chọn phương pháp collocation, ví dụ: 'gauss' với 2 giai đoạn
-    ts, ys = solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0, 
+    
+    ts, ys = solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0,
                                               method_name='gauss', s=2, tol=tol,
                                               L_f_u=L_f_u, L_f_v=L_f_v, L_tau_y=L_tau_y,
-                                              h_min=1e-6, h_max=0.2)
+                                              h_min=1e-6, h_max=0.1)
     
-    # Vẽ đồ thị nghiệm tại các điểm bước
-    plt.figure(figsize=(10,6))
-    plt.plot(ts, ys[:,0], 'o-', label='Nghiệm tại điểm bước')
-    
-    # Vẽ nghiệm nội suy (trên từng đoạn) nếu cần
+    # Vẽ đồ thị nghiệm tại các điểm bước (ở đây vẽ thành phần đầu tiên nếu y là vector)
+    plt.figure(figsize=(10, 6))
+    plt.plot(ts, ys[:, 0], 'o-', label='Nghiệm tại điểm bước')
     plt.xlabel('t')
     plt.ylabel('y(t)')
-    plt.title("Giải DDE thích nghi: y'(t) = -y(t) + y(t-1), y(t)=1 cho t<=0")
+    plt.title("Giải DDE")
     plt.legend()
     plt.show()
+    
+    # Hàm nghiệm chính xác và tính sai số
+    def y_exact(t):
+        return F(t)
+    
+    def compute_error(ts, ys):
+        return np.abs(ys[:, 0] - y_exact(ts))
+    
+    errors = compute_error(ts, ys)
+    
+    def plot_error(ts, errors):
+        plt.figure(figsize=(10, 6))
+        plt.plot(ts, errors, 'r-', label='Sai số')
+        plt.xlabel('t')
+        plt.ylabel('Sai số')
+        plt.yscale('log')
+        plt.title("Sai số giữa nghiệm chính xác và nghiệm nội suy")
+        plt.legend()
+        plt.show()
+    
+    plot_error(ts, errors)
