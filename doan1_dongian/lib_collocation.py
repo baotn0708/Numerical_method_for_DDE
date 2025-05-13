@@ -203,92 +203,127 @@ def get_method_order(method_name, s):
 # 6. Thuật toán đa bước thích nghi (Adaptive step size) cho DDE
 # =====================================================
 
-def solve_dde_collocation_adaptive(f, tau, phi, t0, t_end, h0, method_name='gauss', s=2, tol=1e-4,
-                                   L_f_u=None, L_f_v=None, L_tau_y=None, h_min=1e-6, h_max=1.0):
+def solve_dde_collocation(
+    f, tau, phi,
+    t0, t_end,
+    h0,
+    *,                     # all args below là keyword-only
+    method_name='gauss',
+    s=2,
+    adaptive=True,         # nếu False thì dùng counter
+    tol=1e-4,
+    L_f_u=None, L_f_v=None, L_tau_y=None,
+    h_min=1e-6, h_max=1.0,
+    time_tol=1e-12,        # ngưỡng chấm động
+    rounding_decimals=10,  # số chữ số sau dấu thập phân khi round t
+):
     """
-    Giải DDE:
-        y'(t)= f(t, y(t), y(t-τ(t,y(t)))),
-        y(t)= φ(t) cho t<= t0,
-    với thuật toán bước thích nghi sử dụng kỹ thuật step doubling.
-    
-    - h0: bước khởi đầu,
-    - tol: sai số chấp nhận được (local error tolerance).
-    
-    Các ước lượng Lipschitz (L_f_u, L_f_v, L_tau_y) được truyền vào nhằm nhắc rằng cần đảm bảo
-    tính đặt chỉnh của bài toán; trong ví dụ này chưa dùng trực tiếp để điều chỉnh bước.
-    
-    Trả về:
-      ts: mảng thời gian của các bước,
-      ys: nghiệm tại các điểm bước.
+    Giải DDE y'(t)=f(t,y(t),y(t-τ(t,y))) với collocation-Gauss bậc s.
+    Nếu adaptive=True (mặc định) dùng step-doubling điều khiển bước;
+    nếu adaptive=False, chạy bước cố định h0 nhưng tính t bằng counter.
+
+    Trả về (ts, ys) – ndarray thời gian & nghiệm.
     """
     collocation = CollocationMethod(method_name, s)
-    t = t0
-    # Đảm bảo rằng giá trị ban đầu luôn là mảng có ít nhất một chiều
+    p          = get_method_order(method_name, s)   # bậc của công thức
+    SAFETY     = 0.9
+
+    t = round(t0, rounding_decimals)
     y = np.atleast_1d(phi(t0))
-    ts = [t0]
+    ts = [t]
     ys = [y.copy()]
-    history_segments = []  # lưu trữ các đoạn nghiệm đã tính
-    
-    h = h0
-    p = get_method_order(method_name, s)
-    
-    SAFETY = 0.9  # hệ số an toàn khi điều chỉnh bước
-    
-    while t < t_end:
-        if t + h > t_end:
-            h = t_end - t
-        
-        # Lưu lại history_segments trước bước, nếu bước sau bị reject sẽ khôi phục
-        history_backup = history_segments.copy()
-        
-        # Tính nghiệm một bước với bước h (solution full)
-        y_full, K_full = collocation_step_dde(f, tau, get_history_value, phi, t, y, h, collocation, t0, history_segments)
-        
-        # Tính nghiệm qua hai bước với bước h/2 (step doubling)
-        # Bước 1: từ t đến t+h/2
-        y_mid, K_mid = collocation_step_dde(f, tau, get_history_value, phi, t, y, h/2, collocation, t0, history_segments)
-        seg_mid = {
-            't_start': t,
-            't_end': t + h/2,
-            'y_start': y.copy(),
-            'h': h/2,
-            'collocation': collocation,
-            'K': K_mid
-        }
-        history_half = history_segments.copy()
-        history_half.append(seg_mid)
-        # Bước 2: từ t+h/2 đến t+h, dùng y_mid làm giá trị khởi đầu
-        y_half, K_half = collocation_step_dde(f, tau, get_history_value, phi, t + h/2, y_mid, h/2, collocation, t0, history_half)
-        
-        # Ước tính sai số theo kỹ thuật step doubling:
-        # sai số ~ ||y_half - y_full|| / (2^p - 1)
-        error_est = np.linalg.norm(y_half - y_full) / (2**p - 1)
-        
-        if error_est < tol:
-            # Bước được chấp nhận: cập nhật t, y và lưu history
-            t += h
-            y = y_half.copy()
+    history_segments = []
+
+    if not adaptive:
+        # --- Fixed-step bằng counter ---
+        # xác định số bước (làm tròn cho chắc)
+        n_steps = int(round((t_end - t0) / h0))
+        for k in range(1, n_steps + 1):
+            # tính t chính xác từ công thức
+            t_next = round(t0 + k * h0, rounding_decimals)
+            h = t_next - t
+
+            # một bước collocation-DDE
+            y_new, K_new = collocation_step_dde(
+                f, tau, get_history_value, phi,
+                t, y, h, collocation, t0, history_segments
+            )
+
+            # lưu lịch sử
+            history_segments.append(
+                dict(t_start=t, t_end=t_next, y_start=y.copy(),
+                     h=h, collocation=collocation, K=K_new)
+            )
+
+            # cập nhật
+            t = t_next
+            y = y_new.copy()
             ts.append(t)
             ys.append(y.copy())
-            seg = {
-                't_start': ts[-2],
-                't_end': t,
-                'y_start': ys[-2].copy(),
-                'h': h,
-                'collocation': collocation,
-                'K': K_full  # lưu lại hệ số K từ bước full
-            }
-            history_segments.append(seg)
-            # Điều chỉnh bước mới (có thể tăng nếu sai số nhỏ)
-            factor = SAFETY * (tol / error_est)**(1/(p+1))
-            h = min(h * min(2.0, max(0.1, factor)), h_max)
-        else:
-            # Bước không chấp nhận, giảm bước và thử lại
-            factor = SAFETY * (tol / error_est)**(1/(p+1))
-            h = max(h * max(0.1, factor), h_min)
-            history_segments = history_backup  # khôi phục lại history
-            print(f"Step rejected at t={t:.4f}, error={error_est:.2e}, new h={h:.2e}")
-    
+
+        # đảm bảo điểm cuối đúng t_end
+        if abs(ts[-1] - t_end) < time_tol:
+            ts[-1] = t_end
+
+    else:
+        # --- Adaptive step-doubling như trước, chỉ thêm clamp bước cuối ---
+        h = h0
+        while t < t_end - time_tol:
+            # clamp để không vượt quá t_end
+            if t + h > t_end - time_tol:
+                h = t_end - t
+
+            # backup history
+            history_backup = history_segments.copy()
+
+            # 1 bước h
+            y_full, K_full = collocation_step_dde(
+                f, tau, get_history_value, phi,
+                t, y, h, collocation, t0, history_segments
+            )
+
+            # 2 bước h/2
+            y_mid, K_mid = collocation_step_dde(
+                f, tau, get_history_value, phi,
+                t, y, h/2, collocation, t0, history_segments
+            )
+            seg_mid = dict(t_start=t, t_end=t+h/2, y_start=y.copy(),
+                           h=h/2, collocation=collocation, K=K_mid)
+            history_half = history_segments.copy() + [seg_mid]
+            y_half, K_half = collocation_step_dde(
+                f, tau, get_history_value, phi,
+                t + h/2, y_mid, h/2, collocation, t0, history_half
+            )
+
+            # ước tính sai số
+            err = np.linalg.norm(y_half - y_full) / (2**p - 1)
+
+            if err < tol:
+                # chấp nhận bước
+                t += h
+                # clamp đúng t_end
+                if abs(t - t_end) < time_tol:
+                    t = t_end
+                y = y_half.copy()
+                ts.append(round(t, rounding_decimals))
+                ys.append(y.copy())
+                history_segments.append(
+                    dict(t_start=ts[-2], t_end=t, y_start=ys[-2].copy(),
+                         h=h, collocation=collocation, K=K_full)
+                )
+                # update h
+                factor = SAFETY * (tol/err)**(1/(p+1))
+                h = min(h * min(2.0, max(0.1, factor)), h_max)
+            else:
+                # từ chối bước: rollback, giảm h
+                factor = SAFETY * (tol/err)**(1/(p+1))
+                h = max(h * max(0.1, factor), h_min)
+                history_segments = history_backup
+
+            # nếu đã chạm hoặc vượt t_end thì kết thúc
+            if t >= t_end - time_tol:
+                break
+
     return np.array(ts), np.array(ys)
 
 # =====================================================

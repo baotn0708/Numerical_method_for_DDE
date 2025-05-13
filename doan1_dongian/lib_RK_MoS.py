@@ -102,66 +102,99 @@ def rk_step(t, y, h, sol, f, tau, phi, t0):
     return y_high, err, (k1, k2, k3, k4)
 
 # 5) Thuật toán giải DDE bằng CRK (RK4 + Hermite) với bước tự điều chỉnh
-def solve_dde_adaptive(f, tau, phi, t0, t_final, 
-                       tol=1e-5, h_init=0.1, h_min=1e-8, h_max=0.5):
+def solve_dde(
+    f, tau, phi,
+    t0, t_final,
+    *,
+    adaptive=True,          # Nếu False: dùng counter cho fixed-step
+    tol=1e-5,
+    h_init=0.1,
+    h_min=1e-8, h_max=0.5,
+    time_tol=1e-12,         # ngưỡng so sánh thời gian
+    rounding_decimals=10    # chữ số thập phân khi round t
+):
     """
-    f, tau, phi như mô tả:
-       - f(t, y, y_delay)
-       - tau(t, y)
-       - phi(t): lịch sử
-    t0: thời điểm bắt đầu (ở đây t0=1)
-    t_final: thời điểm kết thúc
-    tol: ngưỡng sai số
-    h_init, h_min, h_max: bước khởi tạo, nhỏ nhất, lớn nhất.
-    Trả về: sol (list các dict {'t':, 'y':, 'f':})
+    Giải DDE y'(t)=f(t,y,y_delay) với RK-embedded.
+    - adaptive=True  : dùng sai số cục bộ và điều chỉnh bước.
+    - adaptive=False : chạy bước cố định h_init nhưng tính t bằng counter.
+
+    Trả về list sol, mỗi phần tử là {'t':, 'y':, 'f':}
     """
     sol = []
-    # Giá trị ban đầu
-    y0 = phi(t0)
-    y_delay0 = phi(t0 - tau(t0, y0))  # vì t0=1 => t0 - tau(1,y0) = 1 - (log(1)+1)=0 => phi(0)=1
-    f0 = f(t0, y0, y_delay0)
-    sol.append({'t': t0, 'y': y0, 'f': f0})
-    
-    t = t0
-    y = y0
-    h = h_init
-    
-    while t < t_final:
-        # Điều chỉnh để không vượt quá t_final
-        if t + h > t_final:
-            h = t_final - t
-        
-        # Tính một bước
-        y_high, err, k_stages = rk_step(t, y, h, sol, f, tau, phi, t0)
-        
-        # Nếu sai số < tol, chấp nhận bước
-        if err <= tol:
-            t_new = t + h
-            y_new = y_high
-            # Tính f tại nút mới
-            y_delay_new = get_y_at(t_new - tau(t_new, y_new), sol, phi, t0)
-            f_new = f(t_new, y_new, y_delay_new)
-            sol.append({'t': t_new, 'y': y_new, 'f': f_new})
-            
-            t = t_new
-            y = y_new
-            
-            # Điều chỉnh bước cho lần tiếp theo (theo quy tắc tỉ lệ 1/4)
-            # Hệ số an toàn 0.9
-            factor = 0.9 * (tol / (err + 1e-14))**0.25
-            h = min(h * factor, h_max)
-        else:
-            # Sai số quá lớn => giảm bước
-            factor = 0.9 * (tol / (err + 1e-14))**0.25
-            h = max(h * factor, h_min)
-            # In cảnh báo nếu muốn
-            print(f"  [Giảm bước] t={t:.5f}, h={h:.3e}, err={err:.3e}")
-            
-        # Nếu h quá nhỏ mà vẫn không thoả mãn, có thể dừng/báo lỗi.
-        if h < 1e-14:
-            print("Bước quá nhỏ, có thể bài toán không thỏa mãn giả định Lipschitz hoặc sai số quá chặt.")
-            break
-    
+    # --- Khởi tạo ---
+    t = round(t0, rounding_decimals)
+    y = phi(t0)
+    y_delay0 = phi(t0 - tau(t0, y))
+    f0 = f(t, y, y_delay0)
+    sol.append({'t': t, 'y': y, 'f': f0})
+
+    if not adaptive:
+        # --- Fixed-step bằng counter ---
+        # tính số bước N (làm tròn cho chắc)
+        N = int(round((t_final - t0) / h_init))
+        for k in range(1, N + 1):
+            t_next = round(t0 + k * h_init, rounding_decimals)
+            h = t_next - t
+
+            # một bước RK-embedded
+            y_high, err, k_stages = rk_step(t, y, h, sol, f, tau, phi, t0)
+
+            # delay tại t_next
+            y_delay = get_y_at(t_next - tau(t_next, y_high), sol, phi, t0)
+            f_new   = f(t_next, y_high, y_delay)
+
+            # lưu sol và history
+            sol.append({'t': t_next, 'y': y_high, 'f': f_new})
+
+            # cập nhật
+            t, y = t_next, y_high
+
+        # clamp bước cuối cho chính xác
+        if abs(sol[-1]['t'] - t_final) < time_tol:
+            sol[-1]['t'] = t_final
+
+    else:
+        # --- Adaptive step control như cũ, thêm clamp cuối ---
+        h = h_init
+        while t < t_final - time_tol:
+            # cắt bước cho khít t_final
+            if t + h > t_final - time_tol:
+                h = t_final - t
+
+            # RK step
+            y_high, err, k_stages = rk_step(t, y, h, sol, f, tau, phi, t0)
+
+            if err <= tol:
+                # chấp nhận bước
+                t_new = t + h
+                # clamp sai số chấm động
+                if abs(t_new - t_final) < time_tol:
+                    t_new = t_final
+
+                y = y_high
+                y_delay = get_y_at(t_new - tau(t_new, y), sol, phi, t0)
+                f_new   = f(t_new, y, y_delay)
+
+                sol.append({
+                    't': round(t_new, rounding_decimals),
+                    'y': y,
+                    'f': f_new
+                })
+                t = t_new
+
+                # update h (p=4 => exponent=1/4)
+                factor = 0.9 * (tol / (err + 1e-14))**0.25
+                h = min(h * factor, h_max)
+            else:
+                # từ chối bước, giảm h
+                factor = 0.9 * (tol / (err + 1e-14))**0.25
+                h = max(h * factor, h_min)
+                print(f"[reject] t={t:.5f}, new h={h:.2e}, err={err:.2e}")
+
+            if adaptive and h < 1e-14:
+                print("Bước quá nhỏ – kiểm tra giả thiết Lipschitz hoặc giảm tol.")
+                break
+
     return sol
 
 def f_example(t, y, y_delay):
